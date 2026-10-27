@@ -1,0 +1,68 @@
+ReAct: Synergizing Reasoning and Acting in Language Models
+ReAct 的关键思想是将语言模型的推理（Reasoning）与外部环境中的行动（Acting）交替结合，使模型能够在执行任务的过程中利用环境反馈不断调整后续决策。
+它不是在模型内部增加了一个特殊的 Agent 神经网络层，而是通过特定的 Prompt 格式、语言模型生成和外部环境交互，形成一个循环执行的系统。（将得到的一个结果重新作为输入成为模型的上下文从而使模型在此基础上继续思考）
+1、Agent 的 Action 是怎么产生的？
+  在原始 ReAct 方法中，研究者首先为语言模型提供包含任务示例的 Prompt。
+
+这些示例展示：
+- Thought：当前应该如何推理。
+- Action：接下来应该执行什么操作。
+- Observation：执行操作后，环境返回了什么。
+模型学习这种示例格式，随后根据当前任务和已有交互历史，自回归地生成下一段 Thought 或 Action。
+
+在论文的知识问答场景中，Action 可以是 Search[关键词]、Lookup[关键词] 等预先定义好的操作。
+
+例如：
+Question: 谁提出了相对论？
+
+Thought 1:
+我需要查询相对论的提出者。
+
+Action 1:
+Search[theory of relativity]
+
+Observation 1:
+Albert Einstein developed the theory of relativity.
+
+Thought 2:
+已经获得所需信息。
+
+Action 2:
+Finish[Albert Einstein]
+
+
+这里的 Action 1 并不是模型自己直接访问了搜索引擎，而是：
+1. 语言模型生成了符合指定格式的 Action 文本。
+2. 外部执行程序识别这个 Action。
+3. 执行程序调用相应工具。
+4. 工具返回执行结果。
+因此需要区分两个概念：
+
+Action Generation（行动生成） 是语言模型完成的，Action Execution（行动执行） 是外部环境或工具系统完成的。
+
+在工程实现上，可以将生成过程概括为：
+\[
+a_t \sim P_\theta(a \mid q,h_t)
+\]
+
+其中：
+- \(q\)：用户提出的任务。
+- \(h_t\)：截至当前步骤的推理、行动和观察历史。
+- \(a_t\)：模型决定的下一步行动。
+- \(\theta\)：语言模型参数。
+这是对 ReAct 过程的简化数学表达，不是原论文必须采用的独立 Action Policy 网络。
+
+
+2. Thought 为什么能够影响 Action？
+因为 Thought 和 Action 都属于语言模型所处理的上下文。
+
+模型先生成一段推理内容，再继续根据这段内容预测后续 Token，进而产生 Action。
+
+例如：
+Thought:
+搜索结果没有提供出生年份，
+我需要再次查询具体人物的信息。
+
+Action:
+Search[person birth year]
+但是Thought可能不正确
