@@ -1,0 +1,21 @@
+seed: 7
+graph:
+  num_nodes: 6
+  edge_probability: 0.25
+budgets:
+  verification: 5.0
+  recovery: 10.0
+model:
+  intrinsic_error_probability: 0.10
+  edge_propagation_probability: 0.70
+  verifier_sensitivity: 0.90
+  verifier_specificity: 0.95
+  repair_success_probability: 0.85
+  recompute_success_probability: 0.95
+costs:
+  verification: 1.0
+  repair: 1.0
+  recomputation: 0.5
+objective:
+  lambda_residual_loss: 1.0
+  # Placeholder simulator values; calibrate in experiments.
