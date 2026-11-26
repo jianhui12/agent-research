@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import random
+from dataclasses import replace
+
+from .budget_manager import BudgetManager
 
 from .cost_estimator import MonteCarloCostEstimator
 from .joint_sampler import sample_joint_posterior
@@ -13,7 +16,7 @@ from .policy import AMCRPolicy, PolicyDecision, feasible_candidates
 EXTRA_POLICIES = (
     "terminal_once", "terminal_only", "terminal_amcr",
     "amcr_no_stop", "amcr_absolute_gain", "risk_positive_stop",
-    "target_risk_impact", "amcr_independent_worlds",
+    "target_risk_impact", "amcr_independent_worlds", "amcr_optimistic_recovery",
 )
 BENCHMARK_POLICIES = (*LEGACY_POLICIES, *EXTRA_POLICIES)
 
@@ -110,6 +113,32 @@ class IndependentWorldEstimator(MonteCarloCostEstimator):
         return _IndependentWorlds(super()._posterior(state, seed))
 
 
+class OptimisticRecoveryEstimator(MonteCarloCostEstimator):
+    """Planner-only ablation: ignore recovery limits, failures and weighted costs.
+
+    Keep residual/replay error probabilities and dependency semantics intact.
+    This intentionally optimistic planner still executes in the original
+    simulator under the actual hard budgets and actual recovery parameters.
+    """
+    def __init__(self, config, **kwargs):
+        super().__init__(replace(config, lambda_r=0), **kwargs)
+
+    def estimate_many(self, state, candidate_version_ids):
+        branch = state.fork()
+        current = [branch.graph.versions[n.current_version_id]
+                   for n in branch.graph.logical_nodes.values()
+                   if n.current_version_id is not None]
+        bound = sum(a.repair_cost + a.recompute_cost for a in current)
+        branch.budgets = BudgetManager(
+            state.budgets.verification_remaining,
+            max(bound, state.budgets.recovery_remaining),
+        )
+        for a in current:
+            a.repair_success_prob = 1.0
+            a.recompute_success_prob = 1.0
+        return super().estimate_many(branch, candidate_version_ids)
+
+
 def make_benchmark_policy(name, config, *, seed, rollouts, posterior_samples):
     kwargs = dict(seed=seed, rollouts=rollouts, posterior_samples=posterior_samples)
     if name in LEGACY_POLICIES:
@@ -121,8 +150,10 @@ def make_benchmark_policy(name, config, *, seed, rollouts, posterior_samples):
         return TargetRiskImpact(config, seed=seed, posterior_samples=posterior_samples)
     if name not in EXTRA_POLICIES:
         raise ValueError(f"Unknown benchmark policy: {name}")
-    estimator_cls = (IndependentWorldEstimator if name == "amcr_independent_worlds"
-                     else MonteCarloCostEstimator)
+    estimator_cls = {
+        "amcr_independent_worlds": IndependentWorldEstimator,
+        "amcr_optimistic_recovery": OptimisticRecoveryEstimator,
+    }.get(name, MonteCarloCostEstimator)
     estimator = estimator_cls(config, **kwargs)
     if name == "risk_positive_stop":
         return RiskPositiveStop(estimator)
