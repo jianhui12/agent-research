@@ -97,7 +97,9 @@ class AMCRPolicy:
     """
 
     def __init__(self, estimator: PairedEstimator, *, min_gain: float = 0.0,
-                 confidence_z: float = 0.0) -> None:
+                 confidence_z: float = 0.0, adaptive_stop: bool = True,
+                 normalize_cost: bool = True,
+                 target_ids: tuple[str, ...] | None = None) -> None:
         for name, value in (("min_gain", min_gain), ("confidence_z", confidence_z)):
             if (not isinstance(value, (int, float)) or not math.isfinite(value)
                     or value < 0):
@@ -105,9 +107,14 @@ class AMCRPolicy:
         self.estimator = estimator
         self.min_gain = min_gain
         self.confidence_z = confidence_z
+        self.adaptive_stop = adaptive_stop
+        self.normalize_cost = normalize_cost
+        self.target_ids = None if target_ids is None else frozenset(target_ids)
 
     def decide(self, state: DAVState) -> PolicyDecision:
         candidates = feasible_candidates(state)
+        if self.target_ids is not None:
+            candidates = [v for v in candidates if state.graph.versions[v].node_id in self.target_ids]
         if not candidates:
             return PolicyDecision(None, "no_feasible_candidate")
         comparison = self.estimator.estimate_many(state, candidates)
@@ -121,10 +128,12 @@ class AMCRPolicy:
                     or not math.isfinite(se) or se < 0):
                 raise ValueError(f"Invalid action estimate: {version_id}")
             cost = state.graph.versions[version_id].verify_cost
-            ranking.append(RankedAction(version_id, cost, estimate, gain / cost,
+            ranking.append(RankedAction(version_id, cost, estimate,
+                                        gain / cost if self.normalize_cost else gain,
                                         gain - self.confidence_z * se))
         ranking.sort(key=lambda a: (-a.score, a.version_id))
-        eligible = [a for a in ranking if a.conservative_gain > self.min_gain]
+        eligible = ([a for a in ranking if a.conservative_gain > self.min_gain]
+                    if self.adaptive_stop else ranking)
         if not eligible:
             return PolicyDecision(None, "no_positive_gain", tuple(ranking), comparison)
         return PolicyDecision(eligible[0].version_id, "verify", tuple(ranking), comparison)
