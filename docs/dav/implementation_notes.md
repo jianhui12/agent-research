@@ -42,7 +42,7 @@ A new repair/recomputation result creates a new artifact version. Never overwrit
 - `verifier.py`: imperfect verifier and Bayesian posterior updates.
 - `budget_manager.py`: independent verification/recovery ledgers with hard guards.
 - `policy.py`: AMCR candidate selection.
-- `cost_estimator.py`: future exact/Monte Carlo expected-objective estimator.
+- `cost_estimator.py`: one-step paired Monte Carlo action-value estimator.
 - `simulator.py`: episode execution and metrics.
 - `baselines.py`: random, uncertainty, impact, static risk.
 
@@ -278,17 +278,168 @@ print(result.total, result.error_loss, result.blocked_loss)
 - Historical evidence increases inference scope and can make exact inference
   infeasible. Likelihood weighting may degenerate with rare evidence.
 - State contains observations, not a persistent posterior particle population.
-  Cost Estimator still needs conditioned joint samples and consistent latent
-  state transitions: unchanged artifacts must not be resampled per action.
-  It must also preserve action-independent randomness for fair comparisons.
+  The joint sampler, latent transitions and paired Cost Estimator below
+  implement conditioned worlds and preserve action-independent randomness.
 - Objective is additive over explicit outputs; correlated task-level loss or
   joint success requirements need an alternate objective.
-- This is fixed-state expected/realized evaluation, not an implemented
-  counterfactual action-value estimator or AMCR policy.
+- Objective itself evaluates fixed states; the separate Cost Estimator below
+  uses it in counterfactual rollouts. Full adaptive AMCR is still pending.
 
 ### Tests
 
 ```bash
 pytest -v tests/test_state.py tests/test_objective.py tests/test_recovery_engine.py
+pytest -v
+```
+
+
+## Joint posterior, latent transition and Cost Estimator v1
+
+### 1. Conditional joint sampling
+
+`sample_joint_posterior(graph, observations, method="auto", ...)` in
+`joint_sampler.py` represents the joint posterior over **all existing
+artifact versions**, including historical versions needed for evidence.
+Given binary parent errors, the noisy-OR conditional probability is
+
+```text
+q_v(e_pa) = 1 - (1 - p_intrinsic[v]) * product_{u -> v}(1 - t[u,v] * e_u)
+P(e | O) proportional to product_v Bernoulli(e_v; q_v(e_pa))
+                       * product_{v in O} P(O_v | e_v)
+```
+
+Exact mode enumerates joint binary node states after integrating out
+independent edge transmission events. It conservatively limits enumeration
+by the number of uncertain primitive Bernoulli events (default 14).
+MC mode samples the prior in DAG order, weights each whole joint assignment
+by verifier likelihood, and normalizes in log space. This is an approximation,
+not independent marginal sampling. A particle stores an immutable assignment
+and normalized weight; `posterior.draw(n, seed=...)` resamples entire worlds.
+
+For MC, ESS = 1 / sum(normalized_weight_i^2), calculated before resampling.
+By default ESS below 20 or no positive-weight proposals raises
+`PosteriorSamplingError`. Zero-weight MC support does not establish
+impossible evidence, unlike exact enumeration. Exact posterior weights have
+no MC ESS diagnostic. `log_evidence_probability` avoids underflow for
+very small likelihoods. Auto mode uses exact below the event threshold
+and MC above it. Historical operational statuses are not treated as
+ground-truth observations. All probability/likelihood parameters of
+historical versions are assumed immutable.
+
+### 2. Latent transition
+
+`latent_state.py` separates sampled latent worlds from observable DAVState.
+`simulate_verification` draws a binary label from the sampled error and
+the imperfect verifier model. `advance_after_recovery` takes a complete
+pre-action joint world plus an actual RecoveryOutcome and extends it:
+only new output IDs in outcome.replacements receive new error draws.
+Existing versions retain their latent errors even when blocked or
+superseded. A new repaired root samples the configured residual prior;
+a replay samples new intrinsic and edge events using its exact parent
+versions, including unchanged parents' existing errors.
+
+`ScenarioNoise(seed)` supplies stable event-keyed uniforms using BLAKE2b
+with separate keys for verification, operational repair/recompute success,
+new intrinsic errors, and new edge transmissions. RecoveryEngine accepts
+an optional success_uniform(action, old_version_id) callback. Each rollout
+has a distinct seed; candidate actions in that rollout share the seed.
+Identical event keys therefore share noise independently of execution
+order. Different candidate actions may construct different versions
+and need not share every event.
+
+### 3. One-step action value
+
+`MonteCarloCostEstimator` in `cost_estimator.py` implements
+
+```text
+Q(S, stop) = E[J(terminal state) | O]
+Q(S, verify(v)) = E[J(after verify(v), then repair on FAIL, stop) | O]
+gain(v) = Q(S, stop) - Q(S, verify(v))
+```
+
+For every initial posterior world, all candidates share the same initial
+truth, verification/recovery event noise, and budget checkpoint. The
+rollout forks observable state, draws the verifier label, charges the
+verification budget, and attempts recovery on FAIL **without access to
+actual correctness for that decision**. False positives trigger recovery;
+false negatives do not. The rollout uses synthetic callbacks (no real
+tool calls), and evaluate_realized scores the sampled terminal world.
+A failed or unaffordable repair invokes the existing fail-closed blocking
+semantics and incurs the configured noncompletion loss. Past spending
+is excluded from action values because only costs since the checkpoint
+are relevant. Independent hard budget guards remain in force.
+
+`estimate_many` uses one posterior bank and one scenario list for all
+candidate actions; returns the baseline, per-version expected objective,
+decomposed losses and costs, FAIL rate, probability of any blocked target,
+paired mean gain and its Monte Carlo standard error. For a set of M
+rollouts, the paired gain standard error is sample_sd(J_stop - J_action)
+/ sqrt(M). With MC posterior approximation, this uncertainty is conditional
+on the finite posterior bank and does not include posterior approximation
+error. Use multiple independent banks/seeds for overall uncertainty.
+The `estimate(state, candidate_node)` compatibility method takes an exact
+version ID (or None for stop) and returns the scalar mean total. It
+recreates the same seed schedule but is slower than estimate_many.
+
+```python
+from dav.cost_estimator import MonteCarloCostEstimator
+
+estimator = MonteCarloCostEstimator(config, rollouts=1000, seed=42)
+comparison = estimator.estimate_many(state, ["D1@v1", "D2@v1"])
+for v, estimate in comparison.candidates.items():
+    cost = state.graph.versions[v].verify_cost
+    print(v, estimate.expected_total, estimate.marginal_reduction / cost,
+          estimate.paired_gain_standard_error)
+```
+
+Candidate actions must reference usable current versions with no existing
+observation and finite, positive, affordable verification cost.
+The existing policy.rank_candidates helper is compatible but does not
+yet filter candidates or enforce stopping. The next policy module should
+use estimate_many directly, filter feasible actions, and stop if no
+positive estimated gain remains.
+
+### 4. Analytical regression case
+
+One output with intrinsic error 0.4, verifier sensitivity 0.75,
+specificity 0.8, repair operational success 0.8, residual error 0.1,
+error loss 10, noncompletion loss 15, verify cost 1, repair cost 2,
+lambda_v 0.2, lambda_r 0.1 and sufficient budgets:
+
+- P(FAIL) = 0.42.
+- Q(stop) = 4.
+- Expected post-action error loss = 1.336.
+- Expected block loss = 1.26.
+- Expected weighted operation cost = 0.284.
+- Q(verify) = 2.88, gain = 1.12.
+
+This reference tests the entire decision path including false positives,
+not just individual functions.
+
+### Limitations before full AMCR
+
+- A single-step verify/repair-or-stop surrogate is not a globally optimal
+  sequential policy. A verification that only provides information and
+  has no immediate recovery effect will not gain value from future decisions.
+- Operation success, new repair errors and replay primitive errors are
+  independent given the configured probabilities; no empirical calibration
+  or state-dependent repair quality model is assumed.
+- No persistent posterior particle filter is maintained across actual
+  decisions. The posterior is reconstructed from immutable version
+  lineage and evidence. Within each counterfactual, old errors are fixed.
+- Full historical sampling can become expensive on long tasks; exact
+  enumeration is exponential and likelihood weighting may be inaccurate
+  despite an acceptable ESS. Do not interpret ESS as a proof of accuracy.
+- Deep-copy rollouts and retained particle assignments may be costly;
+  profiling and reduced-state/particle inference are future work.
+- Cost Estimator sees synthetic posterior worlds, never the real simulator
+  oracle. Actual simulator, feasible candidate enumeration, adaptive
+  stopping policy, baseline comparisons and empirical experiments remain
+  to be developed.
+
+### Tests
+
+```bash
+pytest -v tests/test_joint_sampler.py tests/test_latent_state.py tests/test_cost_estimator.py
 pytest -v
 ```
