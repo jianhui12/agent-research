@@ -179,6 +179,8 @@ def test_benchmark_trace_and_paired_metrics_are_complete():
         episodes=2, rollouts=4, seed=9, trace=True)
     assert len(rows) == len(traces) == 8
     for row, trace in zip(rows, traces):
+        assert row["target_error_loss"] == cfg.error_loss
+        assert row["target_blocked_loss"] == cfg.blocked_loss
         assert row["steps"] == len(trace["steps"])
         assert row["steps"] == sum(row[k] for k in
             ("true_positive", "false_positive", "true_negative", "false_negative"))
@@ -192,7 +194,7 @@ def test_benchmark_trace_and_paired_metrics_are_complete():
         assert all(t["initial_truth"] == group[0]["initial_truth"] for t in group)
         assert all(t["initial_edges"] == group[0]["initial_edges"] for t in group)
     assert len(summarize_benchmark(rows)) == 4
-    assert len(BENCHMARK_POLICIES) == 16
+    assert len(BENCHMARK_POLICIES) == 17
 
 
 def test_overrides_and_invalid_configuration():
@@ -204,3 +206,19 @@ def test_overrides_and_invalid_configuration():
         replace(ScenarioConfig(), sensitivity=1.5)
     with pytest.raises(ValueError):
         replace(ScenarioConfig(), random_targets=12)
+
+
+def test_optimistic_recovery_ablation_changes_planning_not_actual_budget():
+    state, config = independent()
+    state.budgets.spend_recovery(4)
+    assert policy("amcr", config).decide(state).version_id is None
+    optimistic = policy("amcr_optimistic_recovery", config)
+    decision = optimistic.decide(state)
+    assert decision.version_id == "A@v1"
+    assert state.budgets.recovery_remaining == 0
+    assert state.graph.get_current_version("A").version_id == "A@v1"
+    from dav.simulator import SyntheticSimulator
+    result = SyntheticSimulator(config, max_steps=1).run(state, optimistic, seed=5)
+    assert result.objective.blocked_loss == 16
+    assert result.objective.recovery_cost == 0
+    assert not result.success
