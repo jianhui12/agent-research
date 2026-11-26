@@ -36,7 +36,7 @@ def test_superseding_old_version_invalidates_only_its_descendants():
     affected = graph.supersede_version("D1@v1", "D1@v2")
     assert affected == {"D2@v1", "D3@v1", "D4@v1"}
     assert graph.get_current_version("D1").version_id == "D1@v2"
-    assert graph.versions["D1@v1"].status == NodeStatus.STALE
+    assert graph.versions["D1@v1"].status == NodeStatus.INVALID
     assert graph.versions["D2@v1"].status == NodeStatus.STALE
     assert graph.versions["D1@v2"].status == NodeStatus.VERIFIED
 
