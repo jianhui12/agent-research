@@ -237,6 +237,9 @@ class DependencyGraph:
         if new.version_index <= old.version_index:
             raise ValueError("New version index must be greater than old version index")
         self.logical_nodes[old.node_id].current_version_id = new_version_id
+        # The superseded source is retained for audit, but must no longer be
+        # treated as a trusted current artifact.
+        old.status = NodeStatus.INVALID
         return self.invalidate_versions(old_version_id)
 
     def mark_status(self, version_id: str, status: NodeStatus) -> None:
@@ -274,6 +277,17 @@ class DependencyGraph:
                 elif version_id not in record.output_version_ids:
                     errors.append(f"Execution does not list output {version_id}")
 
+        for source_id, target_id, attrs in self.graph.edges(data=True):
+            execution_id = attrs.get("execution_id")
+            target_execution_id = self.versions[target_id].execution_id
+            if execution_id is None:
+                errors.append(f"Untracked dependency edge {source_id} -> {target_id}")
+            elif execution_id != target_execution_id:
+                errors.append(
+                    f"Edge {source_id} -> {target_id} points to execution "
+                    f"{execution_id}, expected {target_execution_id}"
+                )
+
         for execution_id, record in self.executions.items():
             for version_id in record.input_version_ids:
                 if version_id not in self.versions:
@@ -283,12 +297,22 @@ class DependencyGraph:
                     errors.append(f"{execution_id} references missing output {version_id}")
                 elif self.versions[version_id].execution_id != execution_id:
                     errors.append(f"Output {version_id} has inconsistent execution ID")
-            for source_id in record.input_version_ids:
-                for target_id in record.output_version_ids:
-                    if not self.graph.has_edge(source_id, target_id):
-                        errors.append(
-                            f"Missing provenance edge {source_id} -> {target_id}"
-                        )
+            for target_id in record.output_version_ids:
+                actual_inputs = set(self.graph.predecessors(target_id))
+                expected_inputs = set(record.input_version_ids)
+                if actual_inputs != expected_inputs:
+                    errors.append(
+                        f"Input lineage mismatch for {target_id}: "
+                        f"expected {sorted(expected_inputs)}, got {sorted(actual_inputs)}"
+                    )
+                for source_id in record.input_version_ids:
+                    if self.graph.has_edge(source_id, target_id):
+                        edge_execution = self.graph.edges[source_id, target_id].get("execution_id")
+                        if edge_execution != execution_id:
+                            errors.append(
+                                f"Provenance edge {source_id} -> {target_id} "
+                                f"has wrong execution ID"
+                            )
         return errors
 
     def validate_graph(self) -> None:
