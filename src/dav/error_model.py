@@ -119,8 +119,16 @@ def _likelihood(graph: DependencyGraph, truth: dict[str, bool],
     return likelihood
 
 
+def _nonnegative_finite(value: float, label: str) -> float:
+    """Validate a cost/loss weight, not a Bernoulli probability."""
+    if (not isinstance(value, (int, float)) or not math.isfinite(value)
+            or value < 0):
+        raise ValueError(f"{label} must be finite and non-negative")
+    return float(value)
+
+
 def _loss(graph: DependencyGraph, probabilities: dict[str, float], targets: list[str]) -> float:
-    return sum(_prob(graph.versions[v].loss_weight, f"{v}.loss_weight") *
+    return sum(_nonnegative_finite(graph.versions[v].loss_weight, f"{v}.loss_weight") *
                probabilities[v] for v in targets)
 
 
