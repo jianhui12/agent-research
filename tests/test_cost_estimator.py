@@ -161,3 +161,35 @@ def test_mc_posterior_diagnostics_are_reported():
     assert comparison.posterior_method == "mc"
     assert comparison.posterior_effective_samples == pytest.approx(200)
     assert comparison.log_evidence_probability == pytest.approx(0)
+
+
+def test_diamond_rollout_counts_shared_descendant_recomputation_once():
+    graph = DependencyGraph()
+    for node in ("A", "B", "C", "D"):
+        graph.add_logical_node(node)
+        graph.add_version(node, intrinsic_error_prob=1 if node == "A" else 0,
+                          repair_residual_error_prob=0)
+    graph.record_execution("b", "compute", ["A@v1"], ["B@v1"])
+    graph.record_execution("c", "compute", ["A@v1"], ["C@v1"])
+    graph.record_execution("d", "compute", ["B@v1", "C@v1"], ["D@v1"])
+    state = DAVState(graph, BudgetManager(1, 4))
+    obj = ObjectiveConfig((TaskTarget("D", 10, 15),), 0.2, 0.1)
+    comparison = MonteCarloCostEstimator(obj, rollouts=10).estimate_many(
+        state, ["A@v1"])
+    c = comparison.candidates["A@v1"]
+    assert comparison.baseline.expected_total == 10
+    assert c.expected_recovery_cost == 4
+    assert c.expected_blocked_loss == 0
+    assert c.expected_total == pytest.approx(0.6)
+    assert state.graph.check_lineage() == []
+
+
+def test_false_negative_does_not_trigger_recovery_even_when_output_is_wrong():
+    state = single_state(p=1)
+    state.graph.versions["A@v1"].verifier_sensitivity = 0
+    c = MonteCarloCostEstimator(config(), rollouts=10).estimate_many(
+        state, ["A@v1"]).candidates["A@v1"]
+    assert c.fail_probability == 0
+    assert c.expected_error_loss == 10
+    assert c.expected_recovery_cost == 0
+    assert c.expected_total == pytest.approx(10.2)
