@@ -119,6 +119,9 @@ def run_benchmark(*, scenarios, topologies=("chain", "diamond", "fanout"),
              for _ in range(episodes)]
     rows, traces = [], []
     for scenario_id, scenario in scenarios.items():
+        parameters = asdict(scenario)
+        parameters["target_error_loss"] = parameters.pop("error_loss")
+        parameters["target_blocked_loss"] = parameters.pop("blocked_loss")
         for topology in topologies:
             for episode, (environment_seed, planner_seed, graph_seed) in enumerate(seeds):
                 state, config = make_scenario(topology, scenario, graph_seed=graph_seed)
@@ -150,7 +153,7 @@ def run_benchmark(*, scenarios, topologies=("chain", "diamond", "fanout"),
                         "nodes": len(state.graph.versions),
                         "edges": state.graph.graph.number_of_edges(),
                         "targets": len(config.targets),
-                        **asdict(scenario), **_episode_row(result, state, config),
+                        **parameters, **_episode_row(result, state, config),
                         "seconds": elapsed,
                     }
                     rows.append(row)
