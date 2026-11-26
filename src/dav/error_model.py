@@ -17,6 +17,8 @@ import math
 import random
 from typing import Mapping
 
+import networkx as nx
+
 from .graph import DependencyGraph
 from .models import NodeStatus
 
@@ -41,7 +43,8 @@ def _prob(value: float, label: str) -> float:
 
 
 def _scope(graph: DependencyGraph, target_version_ids: list[str] | None,
-           *, current_only: bool) -> tuple[list[str], list[str]]:
+           *, current_only: bool,
+           evidence_version_ids: tuple[str, ...] = ()) -> tuple[list[str], list[str]]:
     if target_version_ids is not None:
         targets = list(dict.fromkeys(target_version_ids))
     elif current_only:
@@ -54,13 +57,19 @@ def _scope(graph: DependencyGraph, target_version_ids: list[str] | None,
             raise KeyError(f"Unknown artifact version: {v}")
     selected = set(targets)
     for v in targets:
-        selected.update(graph.graph.predecessors(v))
-        selected.update(__import__("networkx").ancestors(graph.graph, v))
-    order = graph.topological_sort(selected)
-    bad = [v for v in order if graph.versions[v].status in UNUSABLE]
+        selected.update(nx.ancestors(graph.graph, v))
+    bad = sorted(v for v in selected if graph.versions[v].status in UNUSABLE)
     if bad:
         raise ValueError("Cannot infer risk from unusable version(s): " + ", ".join(bad))
-    return order, targets
+    # Historical observations describe past artifact errors, even when those
+    # artifacts are no longer consumable. They may inform unchanged ancestors.
+    # Only the explicitly selected target lineage must be operationally usable.
+    for v in evidence_version_ids:
+        if v not in graph.versions:
+            raise KeyError(f"Unknown observation version: {v}")
+        selected.add(v)
+        selected.update(nx.ancestors(graph.graph, v))
+    return graph.topological_sort(selected), targets
 
 
 def _primitive_variables(graph: DependencyGraph, order: list[str]):
@@ -155,15 +164,20 @@ def infer_error_risks(
     observations: Mapping[str, str] | None = None,
     samples: int = 10000, seed: int | None = None,
     max_exact_events: int = 20, current_only: bool = True,
+    include_evidence_history: bool = False,
 ) -> RiskEstimate:
     """Infer joint-model marginals conditional on noisy verifier evidence.
 
     target_version_ids limits the modeled ancestry and weighted loss terms; all
     ancestors are still included in returned probabilities. By default infer
     all current version outputs (and required ancestors) and weight current
-    versions. Invalid/stale/blocked lineage raises instead of counting as safe.
+    versions. Invalid/stale/blocked target lineage raises instead of counting as safe.
+    Opt in to include_evidence_history to condition on historical observations
+    without making those versions operationally usable or charging their loss.
     """
-    order, targets = _scope(graph, target_version_ids, current_only=current_only)
+    evidence_ids = tuple(observations or {}) if include_evidence_history else ()
+    order, targets = _scope(graph, target_version_ids, current_only=current_only,
+                            evidence_version_ids=evidence_ids)
     variables = _primitive_variables(graph, order)
     obs = _observations(graph, observations, order)
     if method not in ("exact", "mc"):
