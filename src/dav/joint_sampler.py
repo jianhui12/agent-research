@@ -190,3 +190,14 @@ def sample_joint_posterior(
         method=method, log_evidence_probability=min(0.0, log_evidence),
         effective_sample_size=ess, proposal_count=samples if method == "mc" else None,
     )
+
+
+def sample_prior_world(graph: DependencyGraph, *, seed: int = 0) -> dict[str, bool]:
+    """One ancestral prior draw over all existing versions, without resampling.
+
+    Used for a fresh synthetic episode with no initial verifier evidence.
+    Operational status is not a latent correctness label.
+    """
+    factors, _ = _factors(graph, {})
+    errors, _ = next(_mc(factors, 1, seed))
+    return errors
