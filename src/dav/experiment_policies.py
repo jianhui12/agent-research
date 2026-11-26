@@ -54,9 +54,9 @@ class RiskPositiveStop:
         d = self.amcr.decide(state)
         if d.version_id is None:
             return d
-        posterior = sample_joint_posterior(
-            state.graph, state.observations,
-            samples=self.estimator.posterior_samples, seed=self.estimator.seed)
+        # Reconstruct the exact same posterior bank seed used in estimate_many.
+        posterior = self.estimator._posterior(
+            state, random.Random(self.estimator.seed).getrandbits(64))
         eligible = [a for a in d.ranking if a.conservative_gain > self.amcr.min_gain]
         best = min(eligible, key=lambda a: (-posterior.marginal(a.version_id), a.version_id))
         return PolicyDecision(best.version_id, "verify", d.ranking, d.comparison)
