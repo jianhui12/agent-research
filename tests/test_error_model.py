@@ -139,3 +139,11 @@ def test_invalid_params_and_observations_raise():
     with pytest.raises(ValueError, match="scope"):
         infer_error_risks(graph, target_version_ids=["D1@v1"],
                           observations={"D4@v1": "fail"})
+
+
+@pytest.mark.parametrize("weight", [-1, float("nan"), float("inf")])
+def test_loss_weight_rejects_negative_or_nonfinite_values(weight):
+    graph = diamond()
+    graph.versions["D4@v1"].loss_weight = weight
+    with pytest.raises(ValueError, match="loss_weight.*finite and non-negative"):
+        infer_error_risks(graph, target_version_ids=["D4@v1"])
