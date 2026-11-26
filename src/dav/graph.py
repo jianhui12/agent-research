@@ -165,6 +165,7 @@ class DependencyGraph:
                         propagation_prob=attrs.get("propagation_prob", 1.0),
                         input_role=attrs.get("input_role"),
                     )
+                    self.graph.edges[source_id, target_id]["execution_id"] = execution_id
                     added_edges.append((source_id, target_id))
             for output_id in outputs:
                 self.versions[output_id].execution_id = execution_id
