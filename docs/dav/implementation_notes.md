@@ -49,3 +49,53 @@ A new repair/recomputation result creates a new artifact version. Never overwrit
 ## First graph tests
 
 Test shared-descendant deduplication, old-version-only invalidation, cycle rejection, topological order, execution lineage consistency, and preservation of old versions.
+
+
+## Recovery Engine v1 (implemented)
+
+`src/dav/recovery_engine.py` provides `RecoveryEngine.recover(source_version_id, repair, recompute)`.
+
+- `repair(artifact_version) -> value` is an injectable replayable repair callback.
+- `recompute(logical_node_id, tuple[input_artifact_versions]) -> value` is a replayable recomputation callback.
+- Bernoulli samples use the configurable `repair_success_prob` and `recompute_success_prob` on the old artifact version. A seeded `random.Random` enables reproducible experiments.
+- Both callbacks can raise; exceptions become recorded failures rather than silently producing a trusted result.
+- Every attempted repair/recompute spends from **recovery budget**, checked before attempting the operation. Verification budget is untouched.
+- On successful execution, a **new UNVERIFIED version** is created with exact input-version lineage and a recorded execution cost. A successful computation is **not** a verifier PASS.
+- Descendants are found from the old artifact version, deduplicated by version ID, and processed topologically. Shared descendants run at most once.
+- If a required parent is blocked, stale, invalid, or not its logical node's current version, recomputation is blocked; no stale inputs are silently used.
+- A failed repair blocks affected descendants. A failed recomputation or exhausted budget blocks the node and prevents dependent recomputation.
+
+### Minimal usage
+
+```python
+import random
+from dav.budget_manager import BudgetManager
+from dav.recovery_engine import RecoveryEngine
+
+engine = RecoveryEngine(graph, BudgetManager(verification_budget=3, recovery_budget=10),
+                        rng=random.Random(42))
+
+outcome = engine.recover(
+    "D1@v1",
+    repair=lambda old: repaired_value(old),
+    recompute=lambda node_id, parents: recompute_value(node_id, parents),
+)
+print(outcome.success, outcome.replacements, outcome.recovery_spent)
+```
+
+### Current limitations
+
+- Only a **single repair episode** is supported; no retry scheduling or joint candidate selection.
+- Repair/recompute outcomes are treated as **oracle-observable** by the simulation harness. In a realistic environment, outcome uncertainty must be represented in beliefs and a validator must be consulted separately.
+- Callbacks must be deterministic/replayable or idempotent. Side-effecting tool calls require stronger transaction/compensation design.
+- Blocked tasks need a **non-completion penalty** in the future objective; blocked status cannot be treated as zero risk/loss.
+- The Recovery Engine is a first executable recovery path, **not yet AMCR**; it does not decide which node to verify or estimate future costs with Monte Carlo rollouts.
+- The initial implementation does not offer atomic rollback across exceptions thrown during graph mutation and assumes single-threaded execution with a stable DAG.
+- The existing graph model assumes one producer execution per artifact version and does not yet support dynamic changes to dependency shape.
+
+### Test command
+
+```bash
+pytest -v tests/test_recovery_engine.py
+pytest -v
+```
