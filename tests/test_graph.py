@@ -64,3 +64,17 @@ def test_unknown_versions_are_rejected():
     graph = DependencyGraph()
     with pytest.raises(KeyError):
         graph.get_affected_nodes("missing@v1")
+
+def test_recovery_plan_uses_version_lineage_and_deduplicates():
+    from dav.recovery import build_recovery_plan
+
+    graph = build_diamond()
+    graph.add_version("D1", value="corrected", status=NodeStatus.VERIFIED)
+    graph.record_execution("repair-d1", "repair", [], ["D1@v2"])
+    plan = build_recovery_plan(graph, "D1@v1", "D1@v2")
+
+    assert plan.invalidated_source_version == "D1@v1"
+    assert plan.affected_version_ids == frozenset({"D2@v1", "D3@v1", "D4@v1"})
+    assert len(plan.recomputation_order) == 3
+    assert plan.recomputation_order.index("D2@v1") < plan.recomputation_order.index("D4@v1")
+    assert plan.recomputation_order.index("D3@v1") < plan.recomputation_order.index("D4@v1")
