@@ -88,7 +88,7 @@ print(outcome.success, outcome.replacements, outcome.recovery_spent)
 - Only a **single repair episode** is supported; no retry scheduling or joint candidate selection.
 - Repair/recompute outcomes are treated as **oracle-observable** by the simulation harness. In a realistic environment, outcome uncertainty must be represented in beliefs and a validator must be consulted separately.
 - Callbacks must be deterministic/replayable or idempotent. Side-effecting tool calls require stronger transaction/compensation design.
-- Blocked tasks need a **non-completion penalty** in the future objective; blocked status cannot be treated as zero risk/loss.
+- Blocked tasks need a **non-completion penalty**; the terminal objective implemented below now supplies it.
 - The Recovery Engine is a first executable recovery path, **not yet AMCR**; it does not decide which node to verify or estimate future costs with Monte Carlo rollouts.
 - The initial implementation does not offer atomic rollback across exceptions thrown during graph mutation and assumes single-threaded execution with a stable DAG.
 - The existing graph model assumes one producer execution per artifact version and does not yet support dynamic changes to dependency shape.
@@ -135,8 +135,8 @@ raise instead of being interpreted as clean. Explicit
 `target_version_ids` limits the required ancestry and identifies versions
 charged for expected loss. By default, expected loss is the sum of
 `loss_weight * P(error)` for **current** versions, not all historical
-versions. This weighted risk does **not** yet include noncompletion
-penalties for blocked tasks or intervention costs.
+versions. This weighted risk does **not** include noncompletion
+penalties for blocked tasks or intervention costs; use objective.py for those.
 
 ### Example
 
@@ -176,5 +176,119 @@ print(truth, exact.expected_loss, posterior.probabilities)
 
 ```bash
 pytest -v tests/test_error_model.py
+pytest -v
+```
+
+
+## Observable state and terminal objective v1
+
+`DAVState` in `src/dav/state.py` owns a version DAG, independent budget
+ledgers, and an observation map keyed by exact version ID. It does not expose
+latent ground truth. `state.fork()` deep-copies nested graph data, execution
+records, budget balances and evidence; no live callbacks, external services,
+or RNG streams are copied. Payloads must support deepcopy. Candidate rollouts
+must use isolated, side-effect-free simulation callbacks.
+
+- `record_verification(version_id, observation)` validates the current usable
+  lineage, charges verification cost, and records a single binary observation
+  per version. Repeated verification of the same version is unsupported.
+  PASS/FAIL is evidence, not a correctness label or an automatic repair command.
+- `checkpoint()` captures remaining balances; `costs_since(checkpoint)`
+  measures subsequent consumption. Without a checkpoint, costs are cumulative
+  from state construction. Initial supplied observations are already paid.
+- `infer_risks(target_version_ids, method="exact"|"mc", ...)` conditions on
+  all stored evidence, including historical observations. Historical vertices
+  are admitted only as evidence ancestry, not as usable targets. Old evidence
+  may inform shared unchanged ancestors, but never transfers to new versions.
+  The status of a historical vertex is not treated as error ground truth.
+- Current output availability requires every ancestor to be current and
+  operationally usable. Blocked, invalid, stale, repairing, and missing
+  outputs are incomplete for terminal evaluation.
+
+### Recovery risk initialization
+
+A completed recovery operation does not certify the generated artifact.
+`ArtifactVersion.repair_residual_error_prob` is the conditional semantic
+error prior after a completed repair (synthetic default 0.05). It is
+**not** 1 minus `repair_success_prob`; the latter is an operational success
+probability. A repair is modeled as fresh independent reacquisition with
+no data-dependency inputs. Its old source is linked through execution
+metadata, not a noisy-OR propagation edge.
+
+`recompute_intrinsic_error_prob` optionally overrides intrinsic risk of a
+fresh replay; None inherits the previous intrinsic rate. New versions copy
+verification/repair/recompute probabilities, costs, loss weight and metadata,
+but remain UNVERIFIED and do not copy the old posterior or evidence.
+The `posterior_error_prob` field is initialized to the new intrinsic rate
+only; it is not a full marginal. Use state.infer_risks for actual beliefs.
+Recomputation reuses version-edge propagation configuration, so residual
+upstream risk can still propagate. Only current descendants are replayed.
+Historical versions remain available for provenance.
+
+### Objective
+
+`TaskTarget(logical_node_id, error_loss, blocked_loss)` identifies a required
+task output with two independent finite nonnegative penalties.
+`ObjectiveConfig(targets, lambda_v=1.0, lambda_r=1.0)` uses explicit stable
+logical IDs, not historical versions. A missing output for a registered
+logical node is incomplete; an unregistered target is a configuration error.
+
+For each terminal logical target j, let A_j be 1 if its current output
+and all ancestors are usable and 0 otherwise. The per-rollout objective is
+
+```text
+J = sum_j [ A_j * w_j * E_j + (1-A_j) * b_j ]
+    + lambda_v * C_v + lambda_r * C_r
+```
+
+Here E_j is a latent binary error on the current output, w_j is its
+error-loss weight, and b_j is its noncompletion penalty. A blocked
+output is charged once through b_j, not simultaneously through w_j.
+C_v/C_r are actual amounts debited from the separate budgets, not planned
+costs; failed attempted operations are included. Each budget remains a
+hard constraint. Choose b_j relative to task failure severity; zero or small
+noncompletion penalties may favor aborting, and require explicit justification.
+
+`evaluate_expected` computes conditional expected terminal error loss for
+usable outputs via the joint inference model, plus deterministic blocked
+loss and spent costs. `evaluate_realized` instead requires oracle truth for
+usable outputs, and is for synthetic evaluation only. Both return a
+decomposed `ObjectiveResult` with a `total` property.
+
+```python
+from dav.state import DAVState
+from dav.objective import ObjectiveConfig, TaskTarget, evaluate_expected
+
+state = DAVState(graph, budgets)
+config = ObjectiveConfig((TaskTarget("D4", error_loss=10, blocked_loss=15),),
+                         lambda_v=0.2, lambda_r=0.1)
+checkpoint = state.checkpoint()
+branch = state.fork()
+branch.record_verification("D1@v1", "fail")
+# Apply a recovery policy to branch.graph and branch.budgets if appropriate.
+result = evaluate_expected(branch, config, checkpoint=checkpoint)
+print(result.total, result.error_loss, result.blocked_loss)
+```
+
+### Limitations before AMCR
+
+- The 0.05 repair residual prior is a configurable experimental assumption,
+  not measured real-world performance. Reacquisition independence and fresh
+  replay errors are model assumptions, not established properties of tools.
+- Historical evidence increases inference scope and can make exact inference
+  infeasible. Likelihood weighting may degenerate with rare evidence.
+- State contains observations, not a persistent posterior particle population.
+  Cost Estimator still needs conditioned joint samples and consistent latent
+  state transitions: unchanged artifacts must not be resampled per action.
+  It must also preserve action-independent randomness for fair comparisons.
+- Objective is additive over explicit outputs; correlated task-level loss or
+  joint success requirements need an alternate objective.
+- This is fixed-state expected/realized evaluation, not an implemented
+  counterfactual action-value estimator or AMCR policy.
+
+### Tests
+
+```bash
+pytest -v tests/test_state.py tests/test_objective.py tests/test_recovery_engine.py
 pytest -v
 ```
