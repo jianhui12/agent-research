@@ -43,6 +43,11 @@ class ArtifactVersion:
     recompute_cost: float = 1.0
     loss_weight: float = 1.0
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Conditional residual error given a completed repair. This is a synthetic
+    # default, NOT calibrated and NOT the complement of repair_success_prob.
+    repair_residual_error_prob: float = 0.05
+    # None means a fresh replay uses the original intrinsic error rate.
+    recompute_intrinsic_error_prob: float | None = None
 
 
 @dataclass(frozen=True)
