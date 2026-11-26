@@ -53,11 +53,13 @@ class RecoveryEngine:
     def __init__(
         self, graph: DependencyGraph, budgets: BudgetManager,
         *, rng: random.Random | None = None,
+        success_uniform: Callable[[str, str], float] | None = None,
     ) -> None:
         self.graph = graph
         self.budgets = budgets
         self.rng = rng if rng is not None else random.Random()
         self._sequence = 0
+        self.success_uniform = success_uniform
 
     def recover(
         self, source_version_id: str, repair: RepairFunction,
@@ -93,7 +95,7 @@ class RecoveryEngine:
         source.status = NodeStatus.REPAIRING
         try:
             value = repair(source)
-            repaired = self.rng.random() < source.repair_success_prob
+            repaired = self._uniform("repair", source_version_id) < source.repair_success_prob
         except Exception as exc:
             repaired = False
             reason = type(exc).__name__
@@ -148,7 +150,7 @@ class RecoveryEngine:
             self.budgets.spend_recovery(old.recompute_cost)
             try:
                 value = recompute(old.node_id, tuple(graph.versions[p] for p in inputs))
-                succeeded = self.rng.random() < old.recompute_success_prob
+                succeeded = self._uniform("recompute", old_id) < old.recompute_success_prob
             except Exception as exc:
                 succeeded = False
                 reason = type(exc).__name__
@@ -227,6 +229,14 @@ class RecoveryEngine:
             "recompute_intrinsic_error_prob": old.recompute_intrinsic_error_prob,
             "metadata": deepcopy(old.metadata),
         }
+
+    def _uniform(self, action: str, version_id: str) -> float:
+        """Optional event-keyed noise for paired counterfactual rollouts."""
+        value = (self.rng.random() if self.success_uniform is None
+                 else self.success_uniform(action, version_id))
+        if not isinstance(value, (int, float)) or not 0 <= value < 1:
+            raise ValueError("Recovery random draw must be in [0, 1)")
+        return value
 
     def _execution_id(self) -> str:
         while True:
