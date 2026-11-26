@@ -8,3 +8,4 @@ venv/
 .ipynb_checkpoints/
 experiments/results/*
 !experiments/results/.gitkeep
+*.egg-info/
