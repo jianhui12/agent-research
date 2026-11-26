@@ -13,9 +13,9 @@ from statistics import fmean, stdev
 from typing import Iterable, Mapping
 
 from .joint_sampler import JointPosterior, sample_joint_posterior
-from .latent_state import ScenarioNoise, advance_after_recovery, simulate_verification
+from .latent_state import ScenarioNoise
 from .objective import ObjectiveConfig, ObjectiveResult, evaluate_realized
-from .recovery_engine import RecoveryEngine
+from .transition import execute_verification, validate_candidate
 from .state import DAVState
 
 
@@ -50,19 +50,6 @@ class CostComparison:
     log_evidence_probability: float
 
 
-def validate_candidate(state: DAVState, version_id: str) -> None:
-    """Only usable, not-yet-verified versions with positive affordable cost."""
-    if not state.is_usable(version_id):
-        raise ValueError(f"Candidate is unusable: {version_id}")
-    if version_id in state.observations:
-        raise ValueError(f"Candidate already has verification evidence: {version_id}")
-    cost = state.graph.versions[version_id].verify_cost
-    if not isinstance(cost, (int, float)) or not math.isfinite(cost) or cost <= 0:
-        raise ValueError(f"Candidate verification cost must be finite and positive: {version_id}")
-    if cost > state.budgets.verification_remaining:
-        raise ValueError(f"Candidate exceeds verification budget: {version_id}")
-
-
 def _rollout(state: DAVState, config: ObjectiveConfig,
              candidate: str | None, truth: Mapping[str, bool],
              noise: ScenarioNoise) -> RolloutResult:
@@ -71,20 +58,9 @@ def _rollout(state: DAVState, config: ObjectiveConfig,
         return RolloutResult(evaluate_realized(state, config, truth,
                                                checkpoint=checkpoint), None)
     branch = state.fork()
-    observation = simulate_verification(branch.graph, candidate, truth, noise)
-    branch.record_verification(candidate, observation)
-    updated_truth = truth
-    # The action policy sees ONLY the verifier label, not latent truth.
-    if observation == "fail":
-        outcome = RecoveryEngine(
-            branch.graph, branch.budgets, success_uniform=noise.recovery_uniform,
-        ).recover(candidate, repair=lambda old: None,
-                  recompute=lambda node_id, parents: None)
-        # Callbacks are placeholders: semantic errors are sampled by the
-        # generative model, not by real external tools or callback values.
-        updated_truth = advance_after_recovery(branch.graph, truth, outcome, noise)
-    result = evaluate_realized(branch, config, updated_truth, checkpoint=checkpoint)
-    return RolloutResult(result, observation)
+    step = execute_verification(branch, candidate, truth, noise)
+    result = evaluate_realized(branch, config, step.truth, checkpoint=checkpoint)
+    return RolloutResult(result, step.observation)
 
 
 def _se(values: list[float]) -> float:
