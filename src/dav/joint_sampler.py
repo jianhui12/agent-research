@@ -57,11 +57,13 @@ class _Factor:
     likelihood_error: float
 
     def probability(self, errors: Mapping[str, bool]) -> float:
-        no_error = 1 - self.intrinsic
+        # Accumulate noisy-OR probability directly to avoid cancellation
+        # of very small intrinsic probabilities in 1 - (1 - p).
+        probability = self.intrinsic
         for parent, transmission in self.parents:
             if errors[parent]:
-                no_error *= 1 - transmission
-        return min(1.0, max(0.0, 1 - no_error))
+                probability += (1 - probability) * transmission
+        return min(1.0, max(0.0, probability))
 
     def log_likelihood(self, error: bool) -> float:
         likelihood = self.likelihood_error if error else self.likelihood_correct
