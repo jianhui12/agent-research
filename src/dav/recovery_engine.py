@@ -73,13 +73,26 @@ class RecoveryEngine:
             raise ValueError("Can only repair the current version")
         if source.status in UNUSABLE:
             raise ValueError("Cannot repair an unusable version")
-        self._prob(source.repair_success_prob)
+        # Opt-in scenario: derived artifacts must replay their actual inputs.
+        # Existing artifacts without the flag retain fresh acquisition semantics.
+        parents = tuple(graph.graph.predecessors(source_version_id))
+        replay = source.metadata.get("repair_mode") == "replay" and bool(parents)
+        action = "recompute" if replay else "repair"
+        cost = source.recompute_cost if replay else source.repair_cost
+        probability = source.recompute_success_prob if replay else source.repair_success_prob
+        self._prob(probability)
+        if replay and any(
+            graph.versions[p].status in UNUSABLE or
+            graph.get_current_version(graph.versions[p].node_id).version_id != p
+            for p in parents
+        ):
+            raise ValueError("Derived recovery requires usable current inputs")
         # Rebuild current descendants only: never reactivate historical outputs.
         affected = {v for v in graph.get_affected_nodes(source_version_id)
                     if graph.get_current_version(graph.versions[v].node_id).version_id == v}
         # Validate configured probabilities/costs before changing the graph.
-        self._new_version_parameters(source, repairing=True)
-        self._cost(source.repair_cost)
+        self._new_version_parameters(source, repairing=not replay)
+        self._cost(cost)
         for v in affected:
             self._prob(graph.versions[v].recompute_success_prob)
             self._cost(graph.versions[v].recompute_cost)
@@ -87,17 +100,18 @@ class RecoveryEngine:
         result = RecoveryOutcome(source_version_id, affected=affected)
         initial = self.budgets.recovery_remaining
 
-        if source.repair_cost > self.budgets.recovery_remaining:
+        if cost > self.budgets.recovery_remaining:
             source.status = NodeStatus.BLOCKED
             self._block(result, affected)
-            self._event(result, "repair", source_version_id, "budget_exhausted", 0)
+            self._event(result, action, source_version_id, "budget_exhausted", 0)
             return result
 
-        self.budgets.spend_recovery(source.repair_cost)
+        self.budgets.spend_recovery(cost)
         source.status = NodeStatus.REPAIRING
         try:
-            value = repair(source)
-            repaired = self._uniform("repair", source_version_id) < source.repair_success_prob
+            value = (recompute(source.node_id, tuple(graph.versions[p] for p in parents))
+                     if replay else repair(source))
+            repaired = self._uniform(action, source_version_id) < probability
         except Exception as exc:
             repaired = False
             reason = type(exc).__name__
@@ -107,24 +121,31 @@ class RecoveryEngine:
         if not repaired:
             source.status = NodeStatus.BLOCKED
             self._block(result, affected)
-            self._event(result, "repair", source_version_id, "failed",
-                        source.repair_cost, reason=reason)
+            self._event(result, action, source_version_id, "failed",
+                        cost, reason=reason)
             result.recovery_spent = initial - self.budgets.recovery_remaining
             return result
 
         new = graph.add_version(source.node_id, value=value,
                                 status=NodeStatus.UNVERIFIED, make_current=False,
-                                **self._new_version_parameters(source, repairing=True))
+                                **self._new_version_parameters(source, repairing=not replay))
+        edge_metadata = {
+            (p, new.version_id): {
+                "propagation_prob": graph.graph.edges[p, source_version_id].get("propagation_prob", 1.0),
+                "input_role": graph.graph.edges[p, source_version_id].get("input_role"),
+            } for p in parents
+        } if replay else {}
         graph.record_execution(
-            self._execution_id(), "repair", [], [new.version_id],
-            execution_cost=source.repair_cost,
-            metadata={"repaired_from_version": source_version_id},
+            self._execution_id(), action, parents if replay else [], [new.version_id],
+            execution_cost=cost,
+            metadata={("recomputed_from_version" if replay else "repaired_from_version"): source_version_id},
+            edge_metadata=edge_metadata,
         )
         graph.supersede_version(source_version_id, new.version_id)
         result.repaired_version_id = new.version_id
         result.replacements[source_version_id] = new.version_id
-        self._event(result, "repair", source_version_id, "succeeded",
-                    source.repair_cost, new_version_id=new.version_id)
+        self._event(result, action, source_version_id, "succeeded",
+                    cost, new_version_id=new.version_id)
 
         # Exact old-version lineage; shared descendants are processed once.
         for old_id in nx.lexicographical_topological_sort(graph.graph.subgraph(affected)):
