@@ -1,45 +1,34 @@
-"""Probabilistic repair/recompute skeleton; lineage filtering is TODO."""
+"""Recovery planning utilities built on version-aware provenance.
+
+Actual repair/recomputation execution is orchestrated by the recovery runner.
+This module only derives a deterministic, deduplicated plan from graph lineage.
+"""
 from dataclasses import dataclass
-import random
-from .budget_manager import BudgetManager
+
 from .graph import DependencyGraph
 from .models import NodeStatus
 
 
-@dataclass
-class RecoveryResult:
-    success: bool
-    affected: set[str]
+@dataclass(frozen=True)
+class RecoveryPlan:
+    invalidated_source_version: str
+    affected_version_ids: frozenset[str]
+    recomputation_order: tuple[str, ...]
 
 
-def repair_and_recompute(graph: DependencyGraph, node_id: str,
-                         budgets: BudgetManager, rng: random.Random) -> RecoveryResult:
-    node = graph.nodes[node_id]
-    budgets.spend_recovery(node.repair_cost)
-    node.status = NodeStatus.REPAIRING
+def build_recovery_plan(
+    graph: DependencyGraph, old_version_id: str, new_version_id: str
+) -> RecoveryPlan:
+    """Supersede an old artifact and return affected versions in DAG order.
 
-    if rng.random() >= node.repair_success_prob:
-        node.status = NodeStatus.BLOCKED
-        return RecoveryResult(False, set())
-
-    node.version += 1
-    node.status = NodeStatus.VERIFIED
-    affected = graph.invalidate_descendants(node_id)
-
-    for child_id in graph.topological_order(affected):
-        child = graph.nodes[child_id]
-        if child.status == NodeStatus.BLOCKED:
-            continue
-        if any(graph.nodes[parent].status in {
-            NodeStatus.INVALID, NodeStatus.STALE, NodeStatus.BLOCKED
-        } for parent in graph.graph.predecessors(child_id)):
-            child.status = NodeStatus.BLOCKED
-            continue
-        budgets.spend_recovery(child.recompute_cost)
-        if rng.random() < child.recompute_success_prob:
-            child.version += 1
-            child.status = NodeStatus.VERIFIED
-        else:
-            child.status = NodeStatus.BLOCKED
-
-    return RecoveryResult(True, affected)
+    The new version must already exist and should have been produced by a
+    recorded repair execution. The old version remains in the graph for audit.
+    """
+    graph.mark_status(old_version_id, NodeStatus.INVALID)
+    affected = graph.supersede_version(old_version_id, new_version_id)
+    order = graph.topological_sort(affected)
+    return RecoveryPlan(
+        invalidated_source_version=old_version_id,
+        affected_version_ids=frozenset(affected),
+        recomputation_order=tuple(order),
+    )
