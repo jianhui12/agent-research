@@ -99,3 +99,82 @@ print(outcome.success, outcome.replacements, outcome.recovery_spent)
 pytest -v tests/test_recovery_engine.py
 pytest -v
 ```
+
+
+## Error Model v1: correlation-aware exact/Monte Carlo inference
+
+`src/dav/error_model.py` implements a noisy-OR **generative** error model on exact artifact-version lineage:
+
+```text
+E[v] = intrinsic_error[v] OR OR_{u -> v}(E[u] AND transmission[u,v])
+```
+
+Intrinsic errors at each artifact and edge transmission events are independent
+Bernoulli primitives. Derived error indicators can be **correlated** through
+shared ancestor error variables. This distinction matters for a diamond
+D1->D2, D1->D3, D2->D4, D3->D4: with P(E[D1])=0.5 and deterministic edges,
+the correct P(E[D4])=0.5, whereas the legacy independence-product baseline
+gives 0.75.
+
+The public APIs:
+
+- `sample_ground_truth(graph, seed=...)`: draw a joint error realization for a synthetic episode. This is an *oracle* sample, not an observed error label.
+- `infer_error_risks(graph, method="exact", observations={...})`: enumerate primitive independent Bernoulli events. Exact inference is capped by `max_exact_events` (default 20 uncertain primitives) to avoid exponential blow-up.
+- `infer_error_risks(graph, method="mc", samples=10000, seed=..., observations={...})`: Monte Carlo likelihood weighting; supports evidence from imperfect binary verifiers and reproducible seeds. Importance-weight degeneracy is possible for rare evidence, requiring diagnostics in subsequent work.
+- `propagate_error_beliefs(graph)`: old independent-parent marginal approximation retained **only as a baseline**.
+
+`observations` maps artifact version IDs to `"pass"`/`"fail"`. A verifier has
+sensitivity P(fail | error) and specificity P(pass | correct).
+Evidence on a downstream artifact can update upstream error beliefs.
+Inference **does not** set NodeStatus or overwrite `posterior_error_prob`;
+the returned `RiskEstimate.probabilities` is a conditional belief snapshot.
+
+The default scope is all current versions plus their ancestor versions.
+Unusable (INVALID/STALE/BLOCKED/REPAIRING) versions within that scope
+raise instead of being interpreted as clean. Explicit
+`target_version_ids` limits the required ancestry and identifies versions
+charged for expected loss. By default, expected loss is the sum of
+`loss_weight * P(error)` for **current** versions, not all historical
+versions. This weighted risk does **not** yet include noncompletion
+penalties for blocked tasks or intervention costs.
+
+### Example
+
+```python
+from dav.error_model import infer_error_risks, sample_ground_truth
+
+truth = sample_ground_truth(graph, seed=123)
+exact = infer_error_risks(graph, method="exact",
+                          target_version_ids=["D4@v1"])
+posterior = infer_error_risks(
+    graph, method="mc", samples=50000, seed=123,
+    target_version_ids=["D4@v1"],
+    observations={"D4@v1": "pass"},
+)
+print(truth, exact.expected_loss, posterior.probabilities)
+```
+
+### Model assumptions and remaining research work
+
+- This v1 noisy-OR model assumes primitive Bernoulli independence and no
+  hidden correlated tool failures, contextual dependence, or confounding.
+- Source `intrinsic_error_prob` is a prior for new synthetic error draws; it
+  is distinct from `posterior_error_prob`. Do not reuse the posterior as
+  intrinsic probability without a formally defined state update.
+- Evidence likelihood assumes verifier observations are conditionally
+  independent given per-version errors; repeated checks by the same
+  correlated model violate that assumption.
+- `RiskEstimate.expected_loss` is observational risk, **not** an estimate
+  of expected value of verifying or repairing an artifact. Counterfactual
+  interventions and dynamic decision policies remain future work.
+- Exact inference is exponential in uncertain primitive count; MC may have
+  high variance when conditioning on low-probability evidence.
+- This implementation has no graph-level calibration procedure for
+  propagation probabilities or verifier quality parameters.
+
+### Error Model tests
+
+```bash
+pytest -v tests/test_error_model.py
+pytest -v
+```
