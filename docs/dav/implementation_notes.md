@@ -41,9 +41,9 @@ A new repair/recomputation result creates a new artifact version. Never overwrit
 - `error_model.py`: intrinsic error and edge-level propagation probabilities.
 - `verifier.py`: imperfect verifier and Bayesian posterior updates.
 - `budget_manager.py`: independent verification/recovery ledgers with hard guards.
-- `policy.py`: AMCR candidate selection.
+- `policy.py`: feasible AMCR action selection and stopping.
 - `cost_estimator.py`: one-step paired Monte Carlo action-value estimator.
-- `simulator.py`: episode execution and metrics.
+- `simulator.py`: closed-loop synthetic episode execution and metrics.
 - `baselines.py`: random, uncertainty, impact, static risk.
 
 ## First graph tests
@@ -395,9 +395,8 @@ for v, estimate in comparison.candidates.items():
 Candidate actions must reference usable current versions with no existing
 observation and finite, positive, affordable verification cost.
 The existing policy.rank_candidates helper is compatible but does not
-yet filter candidates or enforce stopping. The next policy module should
-use estimate_many directly, filter feasible actions, and stop if no
-positive estimated gain remains.
+yet filter candidates or enforce stopping. AMCRPolicy below uses estimate_many directly, filters feasible actions,
+and stops if no positive eligible gain remains.
 
 ### 4. Analytical regression case
 
@@ -433,13 +432,117 @@ not just individual functions.
 - Deep-copy rollouts and retained particle assignments may be costly;
   profiling and reduced-state/particle inference are future work.
 - Cost Estimator sees synthetic posterior worlds, never the real simulator
-  oracle. Actual simulator, feasible candidate enumeration, adaptive
-  stopping policy, baseline comparisons and empirical experiments remain
-  to be developed.
+  oracle. The simulator and adaptive policy below implement the first three items;
+  baseline comparisons and empirical experiments remain to be developed.
 
 ### Tests
 
 ```bash
 pytest -v tests/test_joint_sampler.py tests/test_latent_state.py tests/test_cost_estimator.py
+pytest -v
+```
+
+
+## Adaptive AMCR and closed-loop synthetic simulator v1
+
+`policy.AMCRPolicy(estimator, min_gain=0.0, confidence_z=0.0)` calls
+`estimate_many` once per decision on a shared posterior bank. The feasible
+set includes usable current versions with no existing observation and
+finite positive verification cost not exceeding the remaining verification
+budget. Recovery budget is not a feasibility filter; recovery failures
+and blocking are included in action value. The rule is
+
+```text
+gain(v) = Q(S, stop) - Q(S, verify(v))
+score(v) = gain(v) / verify_cost(v)
+eligible(v) iff gain(v) - confidence_z * paired_SE(v) > min_gain
+choose the eligible candidate with largest score; stop if none
+```
+
+Defaults implement positive mean gain per unit cost. Equal scores are
+resolved lexicographically by exact version ID. The optional uncertainty
+gate is heuristic, not a simultaneous confidence guarantee. The policy
+returns a PolicyDecision with the selected version, reason, ranking,
+and paired comparison diagnostics. It has no oracle input. The legacy
+rank_candidates helper remains supported.
+
+`transition.execute_verification` is the single synthetic action
+transition used by both Cost Estimator and the simulator. It validates
+the action, generates a verifier observation, charges verification,
+attempts repair/replay on FAIL, and extends latent truth with new
+versions only. Recovery uses deterministic lexicographic topological
+tie-breaking under scarce budget. The transition does not execute external
+tools and does not expose truth to the policy.
+
+`simulator.SyntheticSimulator` runs adaptive verification on an already
+constructed version DAG. A fresh episode draws one complete ancestral
+prior world; a resumed state with observations draws one conditional
+world (approximate when MC is used). The environment seed controls this
+world and independent keyed event uniforms. The policy's estimator seed
+is separately configured. The environment never resamples existing truth.
+At each step the simulator sends a fork of observable state to the
+policy, executes the selected action on the owned state, and repeats
+until no feasible candidate, no positive gain, policy stop, or max_steps.
+The step cap is a safety limit, not a budget. Initial observations and
+costs are already paid; objective counts only new episode spending.
+
+The result exposes a trace of decisions, verifier observations, recovery
+outcomes and budget balances, final task-output metrics, and oracle truth
+for offline evaluation. Task success means every required target is
+available and correct; completion and correct-output rates use all
+required targets as denominator, including those blocked. A blocked
+output is never counted as correct, even when its loss penalty is zero.
+
+### Example
+
+```python
+from dav.budget_manager import BudgetManager
+from dav.cost_estimator import MonteCarloCostEstimator
+from dav.graph import DependencyGraph
+from dav.objective import ObjectiveConfig, TaskTarget
+from dav.policy import AMCRPolicy, StopPolicy
+from dav.simulator import SyntheticSimulator
+from dav.state import DAVState
+
+graph = DependencyGraph()
+for v in ("A", "B"):
+    graph.add_logical_node(v)
+    graph.add_version(v, intrinsic_error_prob=1,
+                      repair_residual_error_prob=0)
+state = DAVState(graph, BudgetManager(3, 3))
+config = ObjectiveConfig((TaskTarget("A", 10, 15),
+                          TaskTarget("B", 20, 30)), 0.2, 0.1)
+policy = AMCRPolicy(MonteCarloCostEstimator(config, rollouts=100, seed=7))
+sim = SyntheticSimulator(config)
+result = sim.run(state, policy, seed=42)
+control = sim.run(state, StopPolicy(), seed=42)
+print([s.decision.version_id for s in result.steps])
+print(result.stop_reason, result.objective.total, result.success)
+print(control.objective.total, control.success)
+# Deterministic theoretical reference: B@v1 then A@v1; no_positive_gain;
+# AMCR cost 0.6, success True; stop cost 30, success False.
+```
+
+### Boundaries and next steps
+
+- AMCR is receding-horizon one-step greedy planning. The actual episode
+  is adaptive and multi-round, but each action's estimated value assumes
+  termination after that action and any recovery. It is not a solution
+  to the globally optimal sequential decision problem.
+- Recovery is attempted on every FAIL, even false positives or insufficient
+  recovery budget; no separate adaptive repair action or retry policy yet.
+- Same environment seeds allow paired synthetic policy comparisons. Do not
+  confuse the policy's hypothetical posterior worlds with environment truth.
+  The simulator samples from the same configured generative model; empirical
+  model mismatch and real tool failures have not been evaluated.
+- Only the no-verification control is implemented here. Next develop
+  random, risk/uncertainty, influence, and cost-aware baselines with
+  controlled synthetic DAG generators and multiple independent episode seeds.
+- Cost Estimator runtime, posterior ESS/rare evidence, and greedy planning
+  limitations remain research issues. No benchmark performance is established
+  by deterministic integration tests.
+
+```bash
+pytest -v tests/test_policy.py tests/test_simulator.py
 pytest -v
 ```
