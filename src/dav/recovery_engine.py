@@ -7,6 +7,8 @@ UNVERIFIED (not VERIFIED) versions. Callbacks must be replayable/idempotent.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
+import math
 import random
 from typing import Any, Callable
 
@@ -68,7 +70,16 @@ class RecoveryEngine:
         if source.status in UNUSABLE:
             raise ValueError("Cannot repair an unusable version")
         self._prob(source.repair_success_prob)
-        affected = graph.get_affected_nodes(source_version_id)
+        # Rebuild current descendants only: never reactivate historical outputs.
+        affected = {v for v in graph.get_affected_nodes(source_version_id)
+                    if graph.get_current_version(graph.versions[v].node_id).version_id == v}
+        # Validate configured probabilities/costs before changing the graph.
+        self._new_version_parameters(source, repairing=True)
+        self._cost(source.repair_cost)
+        for v in affected:
+            self._prob(graph.versions[v].recompute_success_prob)
+            self._cost(graph.versions[v].recompute_cost)
+            self._new_version_parameters(graph.versions[v], repairing=False)
         result = RecoveryOutcome(source_version_id, affected=affected)
         initial = self.budgets.recovery_remaining
 
@@ -98,7 +109,8 @@ class RecoveryEngine:
             return result
 
         new = graph.add_version(source.node_id, value=value,
-                                status=NodeStatus.UNVERIFIED, make_current=False)
+                                status=NodeStatus.UNVERIFIED, make_current=False,
+                                **self._new_version_parameters(source, repairing=True))
         graph.record_execution(
             self._execution_id(), "repair", [], [new.version_id],
             execution_cost=source.repair_cost,
@@ -150,7 +162,8 @@ class RecoveryEngine:
                 continue
 
             new = graph.add_version(old.node_id, value=value,
-                                    status=NodeStatus.UNVERIFIED, make_current=False)
+                                    status=NodeStatus.UNVERIFIED, make_current=False,
+                                    **self._new_version_parameters(old, repairing=False))
             metadata = {
                 (new_parent, new.version_id): {
                     "propagation_prob": graph.graph.edges[original, old_id].get(
@@ -175,8 +188,45 @@ class RecoveryEngine:
 
     @staticmethod
     def _prob(value: float) -> None:
-        if not 0 <= value <= 1:
-            raise ValueError("Success probability must be in [0, 1]")
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("Probability must be finite and in [0, 1]")
+
+    @staticmethod
+    def _cost(value: float) -> None:
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("Recovery cost must be finite and non-negative")
+
+    @classmethod
+    def _new_version_parameters(cls, old: ArtifactVersion, *, repairing: bool) -> dict[str, Any]:
+        """Copy model configuration, never old verification evidence or posterior."""
+        intrinsic = (old.repair_residual_error_prob if repairing else
+                     old.recompute_intrinsic_error_prob)
+        if intrinsic is None and not repairing:
+            intrinsic = old.intrinsic_error_prob
+        for p in (intrinsic, old.repair_residual_error_prob, old.intrinsic_error_prob,
+                  old.verifier_sensitivity, old.verifier_specificity,
+                  old.repair_success_prob, old.recompute_success_prob):
+            cls._prob(p)
+        if old.recompute_intrinsic_error_prob is not None:
+            cls._prob(old.recompute_intrinsic_error_prob)
+        for cost in (old.verify_cost, old.repair_cost, old.recompute_cost, old.loss_weight):
+            cls._cost(cost)
+        return {
+            "intrinsic_error_prob": float(intrinsic),
+            # Intrinsic-only initialization; full marginal is obtained from Error Model.
+            "posterior_error_prob": float(intrinsic),
+            "verifier_sensitivity": old.verifier_sensitivity,
+            "verifier_specificity": old.verifier_specificity,
+            "repair_success_prob": old.repair_success_prob,
+            "recompute_success_prob": old.recompute_success_prob,
+            "verify_cost": old.verify_cost,
+            "repair_cost": old.repair_cost,
+            "recompute_cost": old.recompute_cost,
+            "loss_weight": old.loss_weight,
+            "repair_residual_error_prob": old.repair_residual_error_prob,
+            "recompute_intrinsic_error_prob": old.recompute_intrinsic_error_prob,
+            "metadata": deepcopy(old.metadata),
+        }
 
     def _execution_id(self) -> str:
         while True:
