@@ -12,6 +12,8 @@ import math
 import random
 from typing import Any, Callable
 
+import networkx as nx
+
 from .budget_manager import BudgetManager
 from .graph import DependencyGraph
 from .models import ArtifactVersion, NodeStatus
@@ -125,7 +127,7 @@ class RecoveryEngine:
                     source.repair_cost, new_version_id=new.version_id)
 
         # Exact old-version lineage; shared descendants are processed once.
-        for old_id in graph.topological_sort(affected):
+        for old_id in nx.lexicographical_topological_sort(graph.graph.subgraph(affected)):
             old = graph.versions[old_id]
             parents = tuple(graph.graph.predecessors(old_id))
             inputs = tuple(result.replacements.get(p, p) for p in parents)
