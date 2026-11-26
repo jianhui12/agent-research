@@ -1,4 +1,9 @@
-"""AMCR candidate ranking interface; expected-cost estimator is not implemented."""
+"""AMCR ranking interface; use MonteCarloCostEstimator for one-step values.
+
+Candidate IDs passed to that estimator are exact artifact version IDs.
+This legacy ranking helper does not filter budget or choose a stop action.
+For a shared sample bank and diagnostics, use estimate_many directly.
+"""
 from dataclasses import dataclass
 from typing import Protocol
 
